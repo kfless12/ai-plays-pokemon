@@ -1,0 +1,8 @@
+__pycache__
+.qodo
+Pokemon Red.gb
+Pokemon Red.sav
+state.json
+event_logs.txt
+agent_log.txt
+action.txt
