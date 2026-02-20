@@ -2,8 +2,8 @@
 prompt_templates.py — Prompt formatting for the LLM.
 
 Converts a ContextSnapshot into a structured prompt.
-Prompt refinement will be done in a later iteration — this module
-currently provides minimal formatting to get context to the LLM.
+The LLM plays the game — it decides goals and actions on its own.
+We provide game state context and ask it what to do.
 """
 
 from typing import Dict, List, Optional
@@ -16,22 +16,35 @@ from context.context_builder import ContextSnapshot, BattleInfo, PartyMember
 # ---------------------------------------------------------------------------
 
 PLANNER_SYSTEM_PROMPT = (
-    "You are an AI playing Pokemon Red. Your objective is to complete the game "
-    "and defeat the Elite Four. Pick the best action from the available list. "
-    "Reply with ONLY valid JSON."
+    "You are an AI playing Pokemon Red. Your ultimate objective is to beat the "
+    "Elite Four and become Champion. You must explore, catch Pokemon, battle "
+    "trainers, collect badges, and navigate the world on your own.\n"
+    "\n"
+    "Each turn you will see the game state and must decide what to do.\n"
+    "\n"
+    "If you have no current goal, first set one by responding with:\n"
+    '  {"goal":"your goal description","action":"ACTION_NAME","reason":"why"}\n'
+    "\n"
+    "If you already have a goal, just pick the best action to work toward it:\n"
+    '  {"action":"ACTION_NAME","reason":"why"}\n'
+    "\n"
+    "Reply with ONLY valid JSON. No other text."
 )
 
 
 # ---------------------------------------------------------------------------
-# Minimal formatting (to be expanded in a later iteration)
+# Context formatting
 # ---------------------------------------------------------------------------
 
 def format_context_prompt(snap: ContextSnapshot) -> str:
-    """
-    Format a ContextSnapshot into a text prompt for the LLM.
-    Minimal formatting — prompt refinement comes later.
-    """
+    """Format a ContextSnapshot into a text prompt for the LLM."""
     lines: List[str] = []
+
+    # Goal context (tells the LLM what it's working on)
+    if hasattr(snap, 'task_lines') and snap.task_lines:
+        for tl in snap.task_lines:
+            lines.append(tl)
+        lines.append("")
 
     lines.append(f"Location: {snap.map_name} ({snap.x},{snap.y}) facing {snap.facing}")
     lines.append(f"Money: {snap.money} | Badges: {snap.badges} | Time: {snap.play_time}")
@@ -49,7 +62,7 @@ def format_context_prompt(snap: ContextSnapshot) -> str:
 
     # Party
     if snap.party_count == 0:
-        lines.append("Party: empty")
+        lines.append("Party: empty (you have no Pokemon yet!)")
     else:
         lines.append(f"Party ({snap.party_count}):")
         for m in snap.party:
@@ -102,16 +115,21 @@ def format_context_prompt(snap: ContextSnapshot) -> str:
         lines.append(f"Actions: {', '.join(snap.available_actions)}")
 
     lines.append("")
-    lines.append('Reply with ONLY: {"action":"ACTION_NAME","reason":"brief why"}')
+    lines.append('Respond with JSON: {"action":"ACTION_NAME","reason":"why"}')
+    lines.append('To set a new goal, add: "goal":"your goal description"')
 
     return "\n".join(lines)
 
 
 def format_battle_prompt(snap: ContextSnapshot) -> str:
-    """
-    Prompt for battle decisions.
-    """
+    """Prompt for battle decisions."""
     lines: List[str] = []
+
+    # Goal context
+    if hasattr(snap, 'task_lines') and snap.task_lines:
+        for tl in snap.task_lines:
+            lines.append(tl)
+        lines.append("")
 
     if snap.battle:
         b = snap.battle

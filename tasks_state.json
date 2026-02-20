@@ -1,0 +1,26 @@
+{
+  "current_goal": {
+    "description": "Explore forever",
+    "status": "failed",
+    "created_at": 1771556600.5946772,
+    "completed_at": 1771556600.5952842,
+    "steps_taken": 5,
+    "max_steps": 5,
+    "reason_done": "exceeded 5 step limit without completion",
+    "start_map": 0,
+    "start_x": 9,
+    "start_y": 16,
+    "start_party_count": 0,
+    "start_badges": 0
+  },
+  "goal_history": [
+    {
+      "description": "Explore forever",
+      "status": "failed",
+      "reason_done": "exceeded 5 step limit without completion",
+      "steps_taken": 5,
+      "completed_at": 1771556600.5952842
+    }
+  ],
+  "saved_at": 1771556600.5952954
+}

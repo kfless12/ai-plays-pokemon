@@ -273,6 +273,8 @@ class ContextSnapshot:
     menu_active: bool = False
     input_ignored: bool = False
     screen_text: str = ""           # Decoded text visible on screen (from tile map)
+    # Task context (Objective 2)
+    task_lines: list = field(default_factory=list)  # Lines describing current task/subtask for prompt
     # Party
     party_count: int = 0
     party: List[PartyMember] = field(default_factory=list)

@@ -1,12 +1,8 @@
 """
 llm_client.py — LLM interface for Pokemon Red AI
 
-Communicates with Ollama's local API to get high-level game decisions.
-The LLM picks from predefined actions (GO_STAIRS, EXIT_HOUSE, etc.)
-and the navigator handles the actual pathfinding.
-
-Refactored for Objective 1: uses ContextBuilder + prompt_templates for
-richer, structured context instead of inline prompt building.
+Communicates with Ollama's local API to get game decisions.
+The LLM plays the game — it decides its own goals and picks actions.
 """
 
 import json
@@ -99,37 +95,32 @@ def detect_model() -> str | None:
     return None
 
 
-def build_game_prompt(state: dict, ui: dict, action_history: list[str]) -> str:
+def build_game_prompt(state: dict, ui: dict, action_history: list[str]) -> dict:
     """
-    Build a prompt for high-level decision making using the
-    ContextBuilder and prompt templates.
+    Build a prompt for the LLM using ContextBuilder and prompt templates.
+
+    Returns:
+        {"system": str, "user": str}
     """
     map_id = state.get("map", 0)
     in_battle = ui.get("in_battle", False)
 
-    # Determine available actions
     if in_battle:
         available_actions = ["FIGHT", "RUN"]
     else:
         available_actions = get_available_actions(map_id)
 
-    # Build context snapshot directly from the state dict
     builder = ContextBuilder()
-    # Seed history from the action_history list passed in
     if action_history:
         for a in action_history[-5:]:
             builder.record_action(a)
 
     snapshot = builder.build(state=state, available_actions=available_actions)
-
-    # Format using prompt templates
-    if in_battle:
-        return format_battle_prompt(snapshot)
-    else:
-        return format_context_prompt(snapshot)
+    return format_planner_prompt(snapshot)
 
 
-def query_llm(prompt: str, model: str | None = None, timeout: float = 30.0) -> str | None:
+def query_llm(prompt: str, system: str | None = None,
+              model: str | None = None, timeout: float = 30.0) -> str | None:
     if model is None:
         model = detect_model()
     if model is None:
@@ -141,12 +132,14 @@ def query_llm(prompt: str, model: str | None = None, timeout: float = 30.0) -> s
         "stream": False,
         "options": {
             "temperature": 0.8,
-            "num_predict": 30,
-            "num_ctx": 512,
+            "num_predict": 80,
+            "num_ctx": 2048,
             "top_p": 0.9,
             "repeat_penalty": 1.3,
         },
     }
+    if system:
+        data["system"] = system
 
     result = _ollama_request(GENERATE_URL, data, timeout=timeout)
     if result and "response" in result:
@@ -154,13 +147,21 @@ def query_llm(prompt: str, model: str | None = None, timeout: float = 30.0) -> s
     return None
 
 
-def parse_llm_response(response: str, valid_actions: list[str]) -> tuple[str | None, str]:
+def parse_llm_response(response: str, valid_actions: list[str]) -> dict:
     """
-    Parse the LLM's response into a high-level action name.
-    Returns (action_name, reasoning) or (None, error_msg).
+    Parse the LLM's response into an action (and optionally a goal).
+
+    Returns a dict with:
+      - "action": str | None — the action name
+      - "goal": str | None — a new goal the LLM wants to set
+      - "reason": str — reasoning
+      - "error": str — error message if parsing failed
     """
+    result = {"action": None, "goal": None, "reason": "", "error": ""}
+
     if not response:
-        return None, "empty response"
+        result["error"] = "empty response"
+        return result
 
     text = response.strip()
 
@@ -193,35 +194,61 @@ def parse_llm_response(response: str, valid_actions: list[str]) -> tuple[str | N
                 obj = {}
 
         if obj:
-            action = str(obj.get("action", obj.get("command", ""))).upper().strip()
-            reason = str(obj.get("reason", obj.get("reasoning", "")))
+            # Extract goal if present
+            goal = obj.get("goal", obj.get("new_goal", None))
+            if goal and isinstance(goal, str) and len(goal.strip()) > 3:
+                result["goal"] = goal.strip()
 
-            # Check if it's a valid high-level action
-            if action in valid_actions:
-                return action, reason
+            # Extract action
+            action = str(obj.get("action", obj.get("command", ""))).strip()
+            result["reason"] = str(obj.get("reason", obj.get("reasoning", "")))
 
-            # Try fuzzy matching (LLM might say "go_stairs" or "GO STAIRS")
-            action_clean = action.replace(" ", "_").replace("-", "_")
-            for va in valid_actions:
-                if action_clean == va or action_clean in va or va in action_clean:
-                    return va, reason
+            if action:
+                action_upper = action.upper().replace(" ", "_").replace("-", "_")
 
-            return None, f"invalid action '{action}', valid: {valid_actions}"
+                # Check against valid actions
+                if action_upper in [va.upper() for va in valid_actions]:
+                    result["action"] = action_upper
+                    return result
+
+                # Fuzzy match
+                for va in valid_actions:
+                    va_upper = va.upper()
+                    if action_upper in va_upper or va_upper in action_upper:
+                        result["action"] = va_upper
+                        return result
+
+                # Return the raw action even if not in valid list
+                # (the agent can try to use it)
+                result["action"] = action_upper
+                return result
+
+            # Got a goal but no action — still a valid response
+            if result["goal"]:
+                return result
 
     # No JSON — try to find an action name in the raw text
     upper = text.upper()
     for va in valid_actions:
-        if va in upper:
-            return va, "parsed from text"
+        if va.upper() in upper:
+            result["action"] = va.upper()
+            result["reason"] = "parsed from text"
+            return result
 
-    return None, f"could not parse: {text[:100]}"
+    result["error"] = f"could not parse: {text[:100]}"
+    return result
 
 
 def get_llm_decision(state: dict, ui: dict, action_history: list[str],
-                     timeout: float = 30.0) -> tuple[str | None, str]:
+                     timeout: float = 30.0) -> dict:
     """
-    Ask the LLM for a high-level action decision.
-    Returns (action_name, reasoning) or (None, error_msg).
+    Ask the LLM for a decision.
+
+    Returns a dict with:
+      - "action": str | None
+      - "goal": str | None
+      - "reason": str
+      - "error": str
     """
     map_id = state.get("map", 0)
     in_battle = ui.get("in_battle", False)
@@ -231,10 +258,14 @@ def get_llm_decision(state: dict, ui: dict, action_history: list[str],
     else:
         valid_actions = get_available_actions(map_id)
 
-    prompt = build_game_prompt(state, ui, action_history)
-    response = query_llm(prompt, timeout=timeout)
+    prompt_pair = build_game_prompt(state, ui, action_history)
+    response = query_llm(
+        prompt=prompt_pair["user"],
+        system=prompt_pair["system"],
+        timeout=timeout,
+    )
 
     if response is None:
-        return None, "LLM query failed"
+        return {"action": None, "goal": None, "reason": "", "error": "LLM query failed"}
 
     return parse_llm_response(response, valid_actions)

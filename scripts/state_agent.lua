@@ -17,6 +17,13 @@ local STATE_PATH  = "/home/kfless/pokemon_ai/state.json"
 local ACTION_PATH = "/home/kfless/pokemon_ai/action.txt"
 local LOG_PATH    = "/home/kfless/pokemon_ai/event_logs.txt"
 
+-- ===== Memory helpers =====
+local function u8(a) return emu:read8(a) end
+local function u16le(a) return u8(a) + u8(a+1) * 256 end
+local function bit_set(val, bit_n)
+  return (math.floor(val / (2 ^ bit_n)) % 2) == 1
+end
+
 local function log_event(msg)
   local f = io.open(LOG_PATH, "a")
   if f then
@@ -100,15 +107,59 @@ local ADDR_TILEMAP   = 0xC3A0
 local TILEMAP_WIDTH  = 20
 local TILEMAP_HEIGHT = 18
 
--- ===== Memory helpers =====
-local function u8(a) return emu:read8(a) end
-local function u16le(a) return u8(a) + u8(a+1) * 256 end
-local function bit_set(val, bit_n)
-  return (math.floor(val / (2 ^ bit_n)) % 2) == 1
+-- Compact encoding alphabet for palette index (0..63)
+local ENC64 = {}
+local DEC64 = {}
+local _encchars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+_"
+for i = 1, #_encchars do
+  local ch = _encchars:sub(i, i)
+  ENC64[i - 1] = ch
+  DEC64[ch] = i - 1
 end
 
--- ===== Pokemon Red Character Encoding =====
+-- Minimal tile classification (heuristic). Default to solid '#'.
+local WALKABLE_TILES = {
+  [0x7F] = true, -- blank/space
+  [0x3D] = true, -- common floor/road (approx)
+  [0x52] = true, -- grass considered walkable
+}
+local WATER_TILES = { [0x5A] = true, [0x5B] = true, [0x5C] = true }
+local DOOR_TILES  = { [0x2F] = true, [0x30] = true }
 local CHAR_MAP = {}
+
+local function classify_tile(tile_id)
+  -- Default to walkable; only mark specific known types as special.
+  if WATER_TILES[tile_id] then return "~" end
+  if DOOR_TILES[tile_id]  then return "D" end
+  -- Treat text glyph tiles as walkable overlay as well
+  return "."
+end
+
+local function build_tilemap_compact()
+  local palette = {}
+  local index_of = {}
+  local rows = {}
+  for row = 0, TILEMAP_HEIGHT - 1 do
+    local out = {}
+    for col = 0, TILEMAP_WIDTH - 1 do
+      local tid = u8(ADDR_TILEMAP + row * TILEMAP_WIDTH + col)
+      local idx = index_of[tid]
+      if idx == nil then
+        idx = #palette
+        palette[#palette + 1] = tid
+        index_of[tid] = idx
+      end
+      if idx >= 64 then idx = 63 end
+      out[#out + 1] = ENC64[idx]
+    end
+    rows[#rows + 1] = table.concat(out)
+  end
+  return palette, rows
+end
+
+-- (meta_obstacle_rows generation removed)
+
+-- ===== Pokemon Red Character Encoding =====
 for i = 0, 25 do CHAR_MAP[0x80 + i] = string.char(65 + i) end  -- A-Z
 for i = 0, 25 do CHAR_MAP[0xA0 + i] = string.char(97 + i) end  -- a-z
 for i = 0, 9  do CHAR_MAP[0xF6 + i] = string.char(48 + i) end  -- 0-9
@@ -494,6 +545,25 @@ local function write_state()
     a(string.format("{\"y\":%d,\"x\":%d,\"text_id\":%d}", s.y, s.x, s.text_id))
   end
   a("],")
+
+  -- Compact tile map for navigation
+  local tm_palette, tm_rows = build_tilemap_compact()
+  a(string.format("\"tilemap_width\":%d,", TILEMAP_WIDTH))
+  a(string.format("\"tilemap_height\":%d,", TILEMAP_HEIGHT))
+  a("\"tilemap_palette\":[")
+  for i, tid in ipairs(tm_palette) do
+    if i > 1 then a(",") end
+    a(string.format("%d", tid))
+  end
+  a("],")
+  a("\"tilemap_rows\":[")
+  for i, r in ipairs(tm_rows) do
+    if i > 1 then a(",") end
+    a(string.format("\"%s\"", r))
+  end
+  a("],")
+
+  -- (meta_obstacle_rows removed from JSON output)
 
   a(string.format("\"last_action\":\"%s\"", last_action_str or ""))
   a("}")

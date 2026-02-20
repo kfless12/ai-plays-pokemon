@@ -1,18 +1,20 @@
 """
-agent.py — Pokemon Red AI Agent v5.0 — Navigator + LLM + Rich Context
+agent.py — Pokemon Red AI Agent v7.0 — Self-Directed AI with Goal Tracking
 
 Architecture:
   - Startup: deterministic automation (title → intro → names)
-  - Playing: LLM picks high-level goals (GO_STAIRS, EXIT_HOUSE, GO_OAKS_LAB)
-  - Navigator: handles pathfinding, collision avoidance, step-by-step movement
-  - ContextBuilder: assembles rich context snapshots
-  - The LLM only decides WHAT to do, the navigator handles HOW
+  - Playing: The LLM decides its own goals and actions
+  - GoalManager: remembers what the LLM decided across calls
+  - Navigator: handles pathfinding when the LLM picks a navigation action
+  - Completion: detected from game state changes (map, party, badges)
 
-v5.0 changes (Objective 1 — Richer Context):
-  - ContextBuilder provides structured snapshots before each LLM decision
-  - Short-term memory buffer tracks recent actions and outcomes
-  - Prompt templates produce compact, token-efficient prompts
-  - Context snapshots logged for observability
+v7.0 changes (Objective 2 — AI-Directed Goals):
+  - The LLM sets its own goals ("Go to Oak's Lab to get a starter")
+  - GoalManager persists goals across LLM calls and agent restarts
+  - The LLM is told its current goal each query so it stays focused
+  - Completion detected from game state (not by asking the LLM)
+  - Goal history shows the LLM what it already accomplished/tried
+  - No hardcoded task library — the AI plays the game
 """
 
 import json
@@ -24,6 +26,8 @@ from datetime import datetime
 from llm_client import check_ollama_running, detect_model, get_llm_decision
 from navigator import Navigator, get_available_actions, describe_location
 from context.context_builder import ContextBuilder
+from tasks.manager import GoalManager
+from tasks.base import GoalStatus
 
 STATE_PATH = Path("/home/kfless/pokemon_ai/state.json")
 ACTION_PATH = Path("/home/kfless/pokemon_ai/action.txt")
@@ -32,7 +36,6 @@ AGENT_LOG_PATH = Path("/home/kfless/pokemon_ai/agent_log.txt")
 LLM_ENABLED = True
 LLM_TIMEOUT = 45.0
 LLM_COOLDOWN = 2.0
-FALLBACK_ON_FAIL = True
 
 # --------------- Logging ---------------
 
@@ -208,32 +211,35 @@ class StartupStateMachine:
         return "WAIT"
 
 
-# --------------- LLM + Navigator Policy ---------------
+# --------------- Game Policy: LLM-Directed with Goal Tracking ---------------
 
 class GamePolicy:
     """
-    High-level game policy using LLM for decisions and Navigator for execution.
-    
-    Flow:
-    1. If navigator is active → execute next step
-    2. If no active navigation → build context snapshot, ask LLM for a goal
-    3. Set navigator to that goal
-    4. Navigator handles pathfinding
-
-    v5.0: Integrates ContextBuilder for richer context snapshots and
-    short-term memory buffer tracking actions/outcomes.
+    The AI plays the game. This class:
+    1. Provides game state context to the LLM
+    2. Lets the LLM set its own goals and pick actions
+    3. Tracks goals persistently so the LLM stays focused
+    4. Detects goal completion from game state changes
+    5. Uses the Navigator for pathfinding when the LLM picks a nav action
     """
 
     def __init__(self):
         self.navigator = Navigator()
         self.context_builder = ContextBuilder()
+        self.goal_manager = GoalManager()
         self.llm_available = False
         self.model_name: str | None = None
         self.last_llm_query: float = 0.0
         self.action_history: list[str] = []
-        self.goal_history: list[str] = []
         self.consecutive_failures: int = 0
         self.last_map: int = -1
+
+        # Load persisted goal state
+        if self.goal_manager.load():
+            agent_log("GOALS: Loaded persisted state")
+            if self.goal_manager.current_goal:
+                g = self.goal_manager.current_goal
+                agent_log(f"GOALS: Resuming '{g.description}' ({g.status.value}, {g.steps_taken} steps)")
 
     def initialize_llm(self) -> bool:
         if not check_ollama_running():
@@ -251,18 +257,15 @@ class GamePolicy:
         self.action_history.append(action)
         if len(self.action_history) > 30:
             self.action_history = self.action_history[-30:]
-        # Also record in the context builder's short-term memory
         self.context_builder.record_action(action, outcome)
 
     def update(self, state: dict, ui: dict) -> tuple[str, str]:
-        """
-        Returns (action_string, source_description).
-        """
+        """Returns (action_string, source_description)."""
         map_id = state.get("map", 0)
         x = state.get("x", 0)
         y = state.get("y", 0)
 
-        # Cancel navigation if map changed (we warped/entered a building)
+        # Cancel navigation if map changed
         if map_id != self.last_map and self.last_map != -1:
             if self.navigator.is_active():
                 agent_log(f"NAV: Map changed {self.last_map}->{map_id}, cancelling nav")
@@ -286,20 +289,31 @@ class GamePolicy:
         if ui["in_battle"]:
             return self._battle_policy(state, ui)
 
+        # --- Tick the goal manager: check completion ---
+        goal_status = self.goal_manager.tick(state, ui)
+        if goal_status == GoalStatus.DONE:
+            g = self.goal_manager.current_goal
+            agent_log(f"GOAL DONE: '{g.description}' — {g.reason_done}")
+            self._add_history("goal_done", g.description)
+            self.navigator.cancel()
+        elif goal_status == GoalStatus.FAILED:
+            g = self.goal_manager.current_goal
+            agent_log(f"GOAL FAILED: '{g.description}' — {g.reason_done}")
+            self._add_history("goal_failed", g.description)
+            self.navigator.cancel()
+
         # --- Navigator active: execute next step ---
         if self.navigator.is_active():
             step = self.navigator.next_step(x, y, map_id)
             if step:
                 self._add_history(step)
-                status = self.navigator.get_status()
-                return step, f"nav:{status}"
+                return step, f"nav:{self.navigator.get_status()}"
             else:
-                # Navigation complete or failed
                 agent_log(f"NAV: Completed — {self.navigator.get_status()}")
                 self.navigator.cancel()
 
-        # --- No active navigation: ask LLM for next goal ---
-        return self._get_llm_goal(state, ui, map_id)
+        # --- Ask the LLM what to do ---
+        return self._ask_llm(state, ui, map_id)
 
     def _battle_policy(self, state: dict, ui: dict) -> tuple[str, str]:
         """Simple battle handling — press A to fight."""
@@ -308,82 +322,98 @@ class GamePolicy:
         self._add_history("A")
         return "A", "battle"
 
-    def _get_llm_goal(self, state: dict, ui: dict, map_id: int) -> tuple[str, str]:
-        """Ask the LLM for a high-level goal, or use fallback."""
+    def _ask_llm(self, state: dict, ui: dict, map_id: int) -> tuple[str, str]:
+        """
+        Ask the LLM what to do. The LLM may:
+        - Set a new goal (if it has none or wants to change)
+        - Pick an action to work toward its current goal
+        """
         now = time.time()
 
         # Cooldown between LLM queries
         if now - self.last_llm_query < LLM_COOLDOWN:
-            return self._fallback_action(map_id), "cooldown_fallback"
+            return self._fallback_action(map_id), "cooldown"
 
-        if LLM_ENABLED and self.llm_available:
-            self.last_llm_query = now
+        if not (LLM_ENABLED and self.llm_available):
+            return self._fallback_action(map_id), "llm_unavailable"
 
-            # Build a rich context snapshot before querying the LLM
-            available_actions = get_available_actions(map_id)
-            snapshot = self.context_builder.build(
-                state=state,
-                available_actions=available_actions,
-            )
-            agent_log(
-                f"LLM: Querying for goal on {snapshot.map_name} ({map_id}) "
-                f"party={snapshot.party_count} battle={'yes' if snapshot.battle else 'no'} "
-                f"history={len(snapshot.recent_history)} items"
-            )
+        self.last_llm_query = now
 
-            start = time.time()
+        # Build context snapshot with goal info
+        available_actions = get_available_actions(map_id)
+        snapshot = self.context_builder.build(
+            state=state,
+            available_actions=available_actions,
+        )
+        # Inject goal context so the LLM knows what it's working on
+        snapshot.task_lines = self.goal_manager.get_goal_prompt_lines()
 
-            action_name, reason = get_llm_decision(
-                state, ui, self.goal_history, timeout=LLM_TIMEOUT
-            )
-            elapsed = time.time() - start
+        goal_desc = ""
+        if self.goal_manager.current_goal and self.goal_manager.current_goal.status == GoalStatus.ACTIVE:
+            goal_desc = f" goal='{self.goal_manager.current_goal.description}'"
 
-            if action_name:
-                self.consecutive_failures = 0
-                agent_log(f"LLM: Goal='{action_name}' in {elapsed:.1f}s — {reason}")
-                self.goal_history.append(action_name)
-                if len(self.goal_history) > 20:
-                    self.goal_history = self.goal_history[-20:]
+        agent_log(
+            f"LLM: Querying on {snapshot.map_name} ({map_id}){goal_desc} "
+            f"party={snapshot.party_count} history={len(snapshot.recent_history)}"
+        )
 
-                # Handle special actions
-                if action_name == "INTERACT":
-                    self._add_history("A")
-                    return "A", f"LLM:interact ({elapsed:.1f}s)"
-                if action_name == "WAIT":
-                    return "WAIT", f"LLM:wait ({elapsed:.1f}s)"
-                if action_name == "FIGHT":
-                    self._add_history("A")
-                    return "A", f"LLM:fight ({elapsed:.1f}s)"
-                if action_name == "RUN":
-                    # Navigate to RUN in battle menu
-                    self._add_history("DOWN 16")
-                    return "DOWN 16", f"LLM:run ({elapsed:.1f}s)"
+        start = time.time()
+        decision = get_llm_decision(state, ui, self.action_history, timeout=LLM_TIMEOUT)
+        elapsed = time.time() - start
 
-                # Set navigator goal
-                if self.navigator.set_goal(action_name, map_id):
-                    agent_log(f"NAV: Goal set — {action_name}")
-                    # Immediately take first step
-                    x = state.get("x", 0)
-                    y = state.get("y", 0)
-                    step = self.navigator.next_step(x, y, map_id)
-                    if step:
-                        self._add_history(step)
-                        return step, f"LLM→nav:{action_name} ({elapsed:.1f}s)"
-                else:
-                    agent_log(f"NAV: Failed to set goal '{action_name}' on map {map_id}")
-            else:
-                self.consecutive_failures += 1
-                agent_log(f"LLM: Failed — {reason} (fails={self.consecutive_failures})")
-                if self.consecutive_failures >= 5:
-                    agent_log("LLM: Too many failures, disabling 60s")
-                    self.llm_available = False
+        action_name = decision.get("action")
+        new_goal = decision.get("goal")
+        reason = decision.get("reason", "")
+        error = decision.get("error", "")
 
-        # Fallback
-        return self._fallback_action(map_id), "fallback"
+        # Handle new goal from the LLM
+        if new_goal:
+            self.goal_manager.set_goal(new_goal, state, ui)
+            agent_log(f"GOAL SET: '{new_goal}' in {elapsed:.1f}s")
+
+        if error:
+            self.consecutive_failures += 1
+            agent_log(f"LLM: Failed — {error} (fails={self.consecutive_failures})")
+            if self.consecutive_failures >= 5:
+                agent_log("LLM: Too many failures, disabling 60s")
+                self.llm_available = False
+            return self._fallback_action(map_id), "llm_error"
+
+        if not action_name:
+            return self._fallback_action(map_id), "no_action"
+
+        self.consecutive_failures = 0
+        agent_log(f"LLM: Action='{action_name}' in {elapsed:.1f}s — {reason}")
+
+        # Handle special actions
+        if action_name == "INTERACT":
+            self._add_history("A")
+            return "A", f"LLM:interact ({elapsed:.1f}s)"
+        if action_name == "WAIT":
+            return "WAIT", f"LLM:wait ({elapsed:.1f}s)"
+        if action_name == "FIGHT":
+            self._add_history("A")
+            return "A", f"LLM:fight ({elapsed:.1f}s)"
+        if action_name == "RUN":
+            self._add_history("DOWN 16")
+            return "DOWN 16", f"LLM:run ({elapsed:.1f}s)"
+
+        # Try to use navigator for the action
+        if self.navigator.set_goal(action_name, map_id):
+            agent_log(f"NAV: Goal set — {action_name}")
+            x = state.get("x", 0)
+            y = state.get("y", 0)
+            step = self.navigator.next_step(x, y, map_id)
+            if step:
+                self._add_history(step)
+                return step, f"LLM→nav:{action_name} ({elapsed:.1f}s)"
+
+        # Navigator doesn't know this action — just use fallback
+        agent_log(f"NAV: No waypoint for '{action_name}' on map {map_id}")
+        return self._fallback_action(map_id), f"LLM:{action_name} (no nav)"
 
     def _fallback_action(self, map_id: int) -> str:
-        """Simple fallback when LLM is unavailable."""
-        # Try to pick a sensible default action per map
+        """Simple fallback when LLM is unavailable or between queries."""
         defaults = {
             38: "RIGHT 16",   # bedroom: go right toward stairs
             37: "DOWN 16",    # house 1F: go down toward exit
@@ -400,12 +430,13 @@ class GamePolicy:
 
 def main():
     print("=" * 60)
-    print("Pokemon Red AI Agent v5.0 — Navigator + LLM + Rich Context")
+    print("Pokemon Red AI Agent v7.0 — Self-Directed AI")
     print(f"  Player: {PLAYER_NAME} | Rival: {RIVAL_NAME}")
     print(f"  LLM: {'enabled' if LLM_ENABLED else 'disabled'}")
-    print(f"  Context: ContextBuilder active (short-term memory + snapshots)")
+    print(f"  Goals: AI sets its own goals; tracked persistently")
+    print(f"  Context: ContextBuilder + goal memory + action history")
     print("=" * 60)
-    agent_log("Agent v5.0 started — Navigator + LLM + Rich Context")
+    agent_log("Agent v7.0 started — Self-Directed AI with Goal Tracking")
 
     startup_sm = StartupStateMachine()
     game_policy = GamePolicy()
@@ -479,11 +510,11 @@ def main():
         agent_log(f"f={frame} {loc} [{source}] -> {action}")
         write_action(action)
 
-        # Rate limit: faster during nav, slower waiting for LLM
+        # Rate limit
         if "LLM" in source:
             time.sleep(0.1)
         elif "nav:" in source:
-            time.sleep(0.3)  # give movement time to complete
+            time.sleep(0.3)
         else:
             time.sleep(0.25)
 

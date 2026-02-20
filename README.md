@@ -110,12 +110,16 @@ Design:
 - Define an Action schema (JSON) with type, params, and optional metadata.
 - Action types (initial set):
   - navigate: { to: { x,y | landmark }, path_hint?: [...], allow_encounters?: bool }
+    - navigation should be allowed via path sequence, so go to A first then B etc...
   - interact: { target: npc|sign|door|object }
   - finish_text: {}
   - battle_decision: { move_index|run|switch_index|use_item }
   - party_swap: { from_index, to_index }
   - save_game: { note?: string }
   - wait_until: { condition, timeout_ms }
+  - talk to npc
+  - enter house/go to stairs/go to warp
+  - search grass for pokemon
   - noop: {}
 - Translator layer maps Action -> concrete control intents for Lua.
 - Validation: strict schema check prior to dispatch; reject malformed/unsafe actions.
